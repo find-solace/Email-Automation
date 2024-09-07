@@ -1,0 +1,292 @@
+// Function to send follow-up reminders and handle escalations
+function sendFollowUpReminders() {
+  // Get current hour
+  var currentHour = new Date().getHours();
+
+  // Check if the current time is between 9:00 AM and 6:00 PM
+  if (currentHour < 9 || currentHour >= 18) {
+    Logger.log('Current time is outside of the allowed period (9 AM - 7 PM). Script will not run.');
+    return; // Exit the function if it's outside the allowed period
+  }
+
+  var sheetId = '1TYmNUcIelftbPE-hwZdspss1otzz2D9EOA-xUReU';
+  var trialsSheetName = 'sheet1';
+  var rmSrmSheetName = 'sheet2'; // Name of the RM_SRM sheet
+
+  // Retrieve data from Google Sheets
+  var sheet = SpreadsheetApp.openById(sheetId).getSheetByName(trialsSheetName);
+  var lastRow = sheet.getLastRow();
+  var range = sheet.getRange('A2:I' + lastRow); // Fetches data from columns A to I
+  var data = range.getValues(); // Get all the data in the specified range
+
+  var rmSrmSheet = SpreadsheetApp.openById(sheetId).getSheetByName(rmSrmSheetName);
+  var rmSrmData = rmSrmSheet.getDataRange().getValues(); // Get all data from RM_SRM sheet
+
+  var today = new Date();
+  today.setHours(0, 0, 0, 0); // Set to start of the day
+
+  // Get the current user's email and associated name
+  var currentUserEmail = Session.getActiveUser().getEmail();
+  Logger.log("Current email running: " + currentUserEmail);
+  var emailNameDictionary = getEmailNameDictionary(); // Function to get email-name dictionary
+  var associatedName = emailNameDictionary[currentUserEmail];
+
+  // Filter data to only include rows where the value in column E matches the associated name
+  var filteredData = data.filter(function(row) {
+    return row[4] === associatedName; // Column E (index 4) contains the name
+  });
+
+  // Process only the filtered data
+  filteredData.forEach(function(row) {
+    // Find the index of the row in the original data using composite key
+    var originalRowIndex = data.findIndex(function(dataRow) {
+      return dataRow[2] === row[2] && dataRow[3] === row[3];
+    }) + 2; // Adding 2 to account for the header row and 1-based index
+
+    var branchEmail = row[2]; // Column C (index 2)
+    var emailSubject = row[3]; // Column D (index 3)
+    var reminderStatus = row[6]; // Column G (index 6)
+    var escalationStatus = row[7]; // Column H (index 7)
+    var secondEscalationStatus = row[8]; // column I (index 8)
+
+    var escapedParts = escapeSubjectParts(emailSubject);
+
+    if (reminderStatus !== "sent") {
+      if (sendFollowUpInThread(branchEmail, escapedParts, today)) {
+        sheet.getRange(originalRowIndex, 7).setValue('sent'); // Mark reminder as sent in column G
+      }
+    } else if (escalationStatus !== "sent") {
+      var additionalRecipient = getValueFromSheet(rmSrmData, row[1], 1); // Get additional recipient based on search value from column B
+      if (sendEscalationIfNeeded(branchEmail, escapedParts, today, additionalRecipient)) {
+        sheet.getRange(originalRowIndex, 8).setValue('sent'); // Mark escalation as sent in column H
+      }
+    } else if (secondEscalationStatus != "sent") {
+      var SRMEmail = getValueFromSheet(rmSrmData, row[1], 2); //get the srm email based on search value from column B
+      if (sendSecondEscalationIfNeeded(branchEmail, escapedParts, today, SRMEmail)){
+          sheet.getRange(originalRowIndex, 9).setValue('sent'); //Mark second escalation as sent in column I
+      }
+
+    }
+  })
+};
+
+
+// Function to get email-name dictionary
+function getEmailNameDictionary() {
+  // Define the dictionary with email-name pairs
+  return {
+    'emailaddress1@org.africa': 'name1',
+    'emailaddress2@org.africa': 'name2',
+    'emailaddress3@org.africa': 'name3',
+    'emailaddress4@org.africa': 'name4'
+  };
+}
+
+// Function to escape subject parts for search query
+function escapeSubjectParts(subject) {
+  var words = subject.split(' ');
+  var part1 = words.slice(0, 7).join(' ');
+  var part2 = words.slice(7).join(' ');
+
+  function escapeText(text) {
+    return text
+      .replace(/([\\"])/g, '\\$1')
+      .replace(/&/g, '\\&');
+  }
+
+  return {
+    part1: escapeText(part1),
+    part2: escapeText(part2)
+  };
+}
+
+// Function to send a follow-up reminder within the same thread
+function sendFollowUpInThread(branchEmail, escapedParts, today) {
+  var threads = GmailApp.search('to:' + branchEmail + ' subject:"' + escapedParts.part1 + '" subject:"' + escapedParts.part2 + '"');
+
+  if (threads.length === 0) {
+    Logger.log('No email thread found for subject "' + escapedParts.part1 + ' ' + escapedParts.part2 + '". Skipping row.');
+    return false;
+  }
+
+  var thread = threads[0];
+  var messages = thread.getMessages();
+  var originalMessage = messages[0];
+  var originalTime = originalMessage.getDate();
+
+  if (!isToday(originalTime, today) || !hasElapsedMinutes(originalTime, 30)) {
+    Logger.log('Conditions not met for sending reminder. Skipping...');
+    return false;
+  }
+
+  if (!hasBranchEmailResponded(messages, branchEmail)) {
+    sendReminderMessage(thread, branchEmail);
+    return true; // Indicate that the reminder was sent
+  }
+
+  Logger.log('Recipient has already responded. No reminder sent.');
+  return false;
+}
+
+// Function to send an escalation email
+function sendEscalationIfNeeded(branchEmail, escapedParts, today, additionalRecipient) {
+  var threads = GmailApp.search('to:' + branchEmail + ' subject:"' + escapedParts.part1 + '" subject:"' + escapedParts.part2 + '"');
+
+  if (threads.length === 0) {
+    Logger.log('No email thread found for subject "' + escapedParts.part1 + ' ' + escapedParts.part2 + '". Skipping row.');
+    return false;
+  }
+
+  var thread = threads[0];
+  var messages = thread.getMessages();
+  var originalMessage = messages[0];
+  var originalTime = originalMessage.getDate();
+
+  if (!isToday(originalTime, today) || !hasElapsedHours(originalTime, 2.5)) {
+    Logger.log('Conditions not met for sending escalation. Skipping...');
+    return false;
+  }
+
+  if (!hasBranchEmailResponded(messages, branchEmail)) {
+    sendEscalationMessage(thread, additionalRecipient);
+    return true; // Indicate that the escalation was sent
+  }
+
+  Logger.log('Recipient has already responded. No escalation sent.');
+  return false;
+}
+
+// Utility function to check if the date is today
+function isToday(date, today) {
+  var dateOnly = new Date(date);
+  dateOnly.setHours(0, 0, 0, 0);
+  return dateOnly.getTime() === today.getTime();
+}
+
+// Utility function to check if a certain number of minutes have elapsed
+function hasElapsedMinutes(startTime, minutes) {
+  return (new Date() - startTime) / (1000 * 60) >= minutes;
+}
+
+// Utility function to check if a certain number of hours have elapsed
+function hasElapsedHours(startTime, hours) {
+  return (new Date() - startTime) / (1000 * 60 * 60) >= hours;
+}
+
+// Utility function to check if branch email has responded
+function hasBranchEmailResponded(messages, branchEmail) {
+  for (var j = 1; j < messages.length; j++) {
+    var message = messages[j];
+    var sender = message.getFrom().toLowerCase();
+    if (sender.includes(branchEmail.toLowerCase())) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Utility function to send a reminder message
+function sendReminderMessage(thread, branchEmail) {
+  var recipientName = capitalizeFirstLetter(branchEmail.split('@')[0]);
+  var reminderMessage = "Dear " + recipientName + ",\n\nPolite reminder to respond to the above query.";
+  thread.replyAll(reminderMessage);
+  Logger.log('Polite reminder sent to ' + branchEmail);
+}
+
+// Utility function to send an escalation message with additional recipient
+function sendEscalationMessage(thread, additionalRecipient) {
+  var messages = thread.getMessages();
+  var entireThreadBody = '';
+
+  // var indentation = ' '.repeat(5); // Uniform indentation for all previous messages
+
+  // Concatenate the body of all messages in the thread
+  for (var i = 0; i < messages.length; i++) {
+    var messageHtmlBody = messages[i].getBody();
+
+    //add the identation to the escalation message
+    entireThreadBody += "<br><br>-----<br>" + messageHtmlBody;
+  }
+
+  var escalationMessage = "<p>+" + additionalRecipient + ",</p><p>First Escalation: Branch Non-Responsive.</p>";
+
+  // Add indentation to the entire thread body to separate it from the escalation message
+
+  var fullMessage = escalationMessage + "<br><br>" + entireThreadBody;
+  thread.replyAll(fullMessage, {
+    cc: additionalRecipient,
+    htmlBody: fullMessage
+  });
+  Logger.log('Escalation message sent to ' + additionalRecipient);
+}
+
+//Function to send a second escalation email
+function sendSecondEscalationIfNeeded(branchEmail, escapedParts, today, SRMEmail){
+  var threads = GmailApp.search('to:' + branchEmail + ' subject:"' + escapedParts.part1 + '" subject:"' + escapedParts.part2 + '"');
+
+  if (threads.length ===0){
+    Logger.log('No email thread found for subject "' + escapedParts.part1 + ' ' + escapedParts.part2 + '". Skipping row.');
+    return false;
+  }
+
+  var thread = threads[0];
+  var messages = thread.getMessages();
+  var originalMessage = messages[0];
+  var originalTime = originalMessage.getDate();
+
+  //Check if at least 5 hours have passed since the original message was sent
+
+  if (!isToday(originalTime, today) || !hasElapsedHours(originalTime, 5)){
+    Logger.log('Conditions not met for sending a second escalation. Skipping...');
+    return false;
+  }
+
+  //check if response has been received
+  
+  if (!hasBranchEmailResponded(messages, branchEmail)){
+    sendSecondEscalationMessage(thread, SRMEmail);
+    return true; //Indicate that the second escalation was sent
+  }
+
+  Logger.log('Conditions not met for sending second escalation. Skipping...');
+  return false;
+}
+
+// utility function to send a second escalation message with additional recipient
+function sendSecondEscalationMessage(thread, SRMEmail){
+  var messages = thread.getMessages();
+  var entireThreadBody = '';
+
+  // Concatenate the body of all messages in the thread
+  for (var i = 0; i < messages.length; i++){
+    var messageHtmlBody = messages[i].getBody();
+
+    //add the identation to the escalation message
+    entireThreadBody += "<br><br>-----<br>" + messageHtmlBody;
+  }
+
+  var secondEscalationMessage = "<p>+" + SRMEmail + ",</p><p>Second Escalation: Branch Non-Responsive.</p>";
+
+  var fullMessage = secondEscalationMessage + "<br><br>" + entireThreadBody;
+  thread.replyAll(fullMessage, {
+    cc: SRMEmail,
+    htmlBody: fullMessage
+  })
+  Logger.log('Second Escalation Message sent to ' + SRMEmail);
+}
+
+
+// Utility function to get value from RM_SRM sheet
+function getValueFromSheet(rmSrmData, searchValue, columnIndex) {
+  for (var i = 0; i < rmSrmData.length; i++) {
+    if (rmSrmData[i][0] === searchValue) {
+      return rmSrmData[i][columnIndex]; // Return value from the defined column
+    }
+  }
+
+}
+
+// Utility function to capitalize the first letter of a string
+function capitalizeFirstLetter(string) {
+  return string.charAt(0).toUpperCase() + string.slice(1);
+}
